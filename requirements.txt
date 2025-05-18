@@ -1,0 +1,10 @@
+fastapi==0.95.2
+uvicorn==0.22.0
+python-dotenv==1.0.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+openai==0.28.1
+neo4j==5.12.0
+langchain==0.0.346
+tiktoken==0.5.1
+python-multipart==0.0.6
