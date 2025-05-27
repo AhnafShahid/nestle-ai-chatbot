@@ -1,54 +1,53 @@
-from typing import List, Dict, Optional
-import os
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
-import openai
-from langchain.graphs import Neo4jGraph
-from langchain.vectorstores import Neo4jVector
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.chains import GraphCypherQAChain
-from langchain.chat_models import ChatOpenAI
-from app.scraper import scrape_nestle_site
+import os
+from typing import Optional
 
 load_dotenv()
 
 class GraphRAG:
     def __init__(self):
-        self.uri = os.getenv("NEO4J_URI")
-        self.user = os.getenv("NEO4J_USER")
-        self.password = os.getenv("NEO4J_PASSWORD")
-        self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
-        self.embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-        self.llm = ChatOpenAI(openai_api_key=os.getenv("OPENAI_API_KEY"), model_name="gpt-3.5-turbo")
+        """Initialize Neo4j driver with AuraDB credentials"""
+        self.driver = GraphDatabase.driver(
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
+            encrypted=True  # Required for AuraDB
+        )
         self._initialize_graph()
-    
+
     def _initialize_graph(self):
-        """Initialize the graph database with schema if needed"""
+        """Create necessary constraints and indexes"""
         with self.driver.session() as session:
-            # Create constraints
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Product) REQUIRE p.id IS UNIQUE")
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE")
+            # Create uniqueness constraints
+            session.run("""
+            CREATE CONSTRAINT IF NOT EXISTS 
+            FOR (p:Product) REQUIRE p.id IS UNIQUE
+            """)
+            session.run("""
+            CREATE CONSTRAINT IF NOT EXISTS 
+            FOR (c:Category) REQUIRE c.name IS UNIQUE
+            """)
             
-            # Create full-text index
+            # Create full-text index for search
             session.run("""
             CALL db.index.fulltext.createNodeIndex(
-                'productSearch', 
-                ['Product'], 
+                'productSearch',
+                ['Product'],
                 ['title', 'description']
             )
             """)
-    
+
     def rebuild_graph(self):
         """Rebuild the entire graph from scraped data"""
+        from app.scraper import scrape_nestle_site
         products = scrape_nestle_site()
         
         with self.driver.session() as session:
             # Clear existing data
             session.run("MATCH (n) DETACH DELETE n")
             
-            # Add products and categories
+            # Insert products and relationships
             for product in products:
-                # Create or update product node
                 session.run("""
                 MERGE (p:Product {id: $id})
                 SET p.title = $title,
@@ -57,16 +56,16 @@ class GraphRAG:
                 """, {
                     "id": product["url"],
                     "title": product["title"],
-                    "description": product["description"],
+                    "description": product.get("description", ""),
                     "url": product["url"]
                 })
                 
-                # Add nutritional facts as properties
+                # Add nutrition facts as properties
                 for nutrient, value in product.get("nutrition", {}).items():
-                    session.run("""
-                    MATCH (p:Product {id: $id})
-                    SET p.`%s` = $value
-                    """ % nutrient.replace(" ", "_"), {
+                    session.run(f"""
+                    MATCH (p:Product {{id: $id}})
+                    SET p.`{nutrient.replace(" ", "_")}` = $value
+                    """, {
                         "id": product["url"],
                         "value": value
                     })
@@ -80,70 +79,32 @@ class GraphRAG:
                         "name": category,
                         "id": product["url"]
                     })
-            
-            # Create vector index for semantic search
-            Neo4jVector.from_existing_index(
-                embedding=self.embeddings,
-                index_name="product_embeddings",
-                node_label="Product",
-                text_node_properties=["title", "description"],
-                embedding_node_property="embedding",
-                url=self.uri,
-                username=self.user,
-                password=self.password
-            )
-    
-    def add_node(self, label: str, properties: dict) -> str:
-        """Add a new node to the graph"""
-        with self.driver.session() as session:
-            result = session.run(
-                f"CREATE (n:{label} $props) RETURN id(n) as node_id",
-                props=properties
-            )
-            return str(result.single()["node_id"])
-    
-    def add_relationship(self, source_id: str, target_id: str, relationship_type: str, properties: dict = {}):
-        """Add a relationship between two nodes"""
-        with self.driver.session() as session:
-            session.run("""
-            MATCH (a), (b)
-            WHERE id(a) = $source_id AND id(b) = $target_id
-            CREATE (a)-[r:%s $props]->(b)
-            """ % relationship_type,
-            {
-                "source_id": int(source_id),
-                "target_id": int(target_id),
-                "props": properties
-            })
-    
+
     def query(self, question: str) -> Optional[str]:
-        """Query the knowledge graph for relevant information"""
+        """Query the knowledge graph for relevant products"""
         try:
-            graph = Neo4jGraph(
-                url=self.uri,
-                username=self.user,
-                password=self.password
-            )
-            
-            chain = GraphCypherQAChain.from_llm(
-                llm=self.llm,
-                graph=graph,
-                verbose=True,
-                return_intermediate_steps=True
-            )
-            
-            result = chain(question)
-            
-            if result["intermediate_steps"] and result["intermediate_steps"][0]:
-                cypher_query = result["intermediate_steps"][0]["query"]
-                context = "\n".join([
-                    str(item) 
-                    for item in result["intermediate_steps"][0]["context"]
-                ])
+            with self.driver.session() as session:
+                result = session.run("""
+                    CALL db.index.fulltext.queryNodes('productSearch', $query)
+                    YIELD node, score
+                    RETURN node.title AS title, node.description AS description
+                    ORDER BY score DESC
+                    LIMIT 3
+                """, {"query": question})
                 
-                return f"Knowledge Graph Context:\n{context}\n\nGenerated from query:\n{cypher_query}"
-            
-            return None
+                products = [
+                    f"• {record['title']}: {record['description'][:100]}..."
+                    for record in result
+                ]
+                
+                if not products:
+                    return None
+                
+                return "I found these related products:\n" + "\n".join(products)
         except Exception as e:
-            print(f"Error querying graph: {str(e)}")
+            print(f"Graph query error: {str(e)}")
             return None
+
+    def close(self):
+        """Close the Neo4j driver connection"""
+        self.driver.close()

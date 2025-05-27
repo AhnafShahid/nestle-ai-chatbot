@@ -3,108 +3,107 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
 import os
-from typing import Dict, List
-import hashlib
+from pathlib import Path
 from datetime import datetime
+from typing import List, Dict
 
 BASE_URL = "https://www.madewithnestle.ca/"
 DATA_DIR = "data/scraped"
-os.makedirs(DATA_DIR, exist_ok=True)
 
-def get_page_content(url: str) -> str:
-    """Fetch page content with error handling"""
+def scrape_nestle_site() -> List[Dict]:
+    """Scrape product data from the Made With Nestlé website"""
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; NestleAIBot/1.0; +https://www.madewithnestle.ca/bot)"
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.text
+        # Fetch main page
+        main_page = requests.get(BASE_URL, timeout=10)
+        main_page.raise_for_status()
+        soup = BeautifulSoup(main_page.text, "html.parser")
+        
+        # Extract product links
+        product_links = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/products/" in href:
+                product_links.add(urljoin(BASE_URL, href))
+        
+        # Scrape individual product pages
+        products = []
+        for url in product_links:
+            try:
+                product = scrape_product_page(url)
+                if product:
+                    products.append(product)
+                    save_product_data(product)
+            except Exception as e:
+                print(f"Error scraping {url}: {str(e)}")
+        
+        # Save combined data
+        with open(f"{DATA_DIR}/all_products.json", "w") as f:
+            json.dump(products, f)
+            
+        return products
+        
     except Exception as e:
-        print(f"Error fetching {url}: {str(e)}")
-        return ""
+        print(f"Failed to scrape main page: {str(e)}")
+        return []
 
-def extract_product_info(soup: BeautifulSoup, url: str) -> Dict:
-    """Extract product information from a product page"""
-    product = {
-        "url": url,
-        "title": soup.find("h1").get_text(strip=True) if soup.find("h1") else "",
-        "description": "",
-        "nutrition": {},
-        "categories": [],
-        "scraped_at": datetime.now().isoformat()
-    }
-    
-    # Extract description
-    desc_div = soup.find("div", class_="product-description")
-    if desc_div:
-        product["description"] = desc_div.get_text(strip=True)
-    
-    # Extract nutrition facts
-    nutrition_table = soup.find("table", class_="nutrition-table")
-    if nutrition_table:
-        for row in nutrition_table.find_all("tr"):
+def scrape_product_page(url: str) -> Dict:
+    """Scrape data from a single product page"""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        product = {
+            "url": url,
+            "title": extract_text(soup.find("h1")),
+            "description": extract_text(soup.find("div", class_="product-description")),
+            "nutrition": extract_nutrition(soup),
+            "categories": extract_categories(soup),
+            "scraped_at": datetime.now().isoformat()
+        }
+        
+        return product
+    except Exception as e:
+        print(f"Error scraping product page {url}: {str(e)}")
+        return None
+
+def extract_text(element) -> str:
+    """Extract cleaned text from HTML element"""
+    return element.get_text(strip=True) if element else ""
+
+def extract_nutrition(soup: BeautifulSoup) -> Dict:
+    """Extract nutrition facts from table"""
+    nutrition = {}
+    table = soup.find("table", class_="nutrition-table")
+    if table:
+        for row in table.find_all("tr"):
             cells = row.find_all("td")
             if len(cells) == 2:
                 key = cells[0].get_text(strip=True)
                 value = cells[1].get_text(strip=True)
-                product["nutrition"][key] = value
-    
-    # Extract categories from breadcrumbs
+                nutrition[key] = value
+    return nutrition
+
+def extract_categories(soup: BeautifulSoup) -> List[str]:
+    """Extract categories from breadcrumbs"""
+    categories = []
     breadcrumbs = soup.find("nav", class_="breadcrumb")
     if breadcrumbs:
-        product["categories"] = [
+        categories = [
             a.get_text(strip=True) 
-            for a in breadcrumbs.find_all("a") 
+            for a in breadcrumbs.find_all("a")
             if a.get_text(strip=True)
         ]
-    
-    return product
+    return categories
 
-def scrape_nestle_site() -> List[Dict]:
-    """Main scraping function that crawls the site"""
-    print("Starting to scrape Nestlé website...")
-    visited_urls = set()
-    products = []
-    
-    # Start with the main page
-    main_page = get_page_content(BASE_URL)
-    if not main_page:
-        return []
-    
-    soup = BeautifulSoup(main_page, "html.parser")
-    
-    # Find all product links
-    product_links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        full_url = urljoin(BASE_URL, href)
-        if "/products/" in full_url and full_url not in product_links:
-            product_links.add(full_url)
-    
-    # Process each product page
-    for i, product_url in enumerate(product_links):
-        print(f"Scraping product {i+1}/{len(product_links)}: {product_url}")
-        if product_url in visited_urls:
-            continue
-            
-        visited_urls.add(product_url)
-        page_content = get_page_content(product_url)
-        if not page_content:
-            continue
-            
-        product_soup = BeautifulSoup(page_content, "html.parser")
-        product_info = extract_product_info(product_soup, product_url)
-        products.append(product_info)
-        
-        # Save each product individually
-        product_hash = hashlib.md5(product_url.encode()).hexdigest()
-        with open(f"{DATA_DIR}/{product_hash}.json", "w") as f:
-            json.dump(product_info, f)
-    
-    # Save combined data
-    with open(f"{DATA_DIR}/all_products.json", "w") as f:
-        json.dump(products, f)
-    
-    print(f"Scraping complete. Found {len(products)} products.")
-    return products
+def save_product_data(product: Dict):
+    """Save individual product data to JSON file"""
+    filename = f"{hash(product['url'])}.json"
+    with open(f"{DATA_DIR}/{filename}", "w") as f:
+        json.dump(product, f)
+
+def hash(url: str) -> str:
+    """Generate consistent hash for filenames"""
+    return str(abs(hash(url)))
